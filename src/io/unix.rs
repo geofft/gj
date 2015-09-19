@@ -167,6 +167,9 @@ impl AsyncRead for Stream {
 }
 
 impl AsyncWrite for Stream {
+    /// Writes the entirety of buf asynchronously. The returned promise
+    /// either succeeds or fails with this Stream and the provided
+    /// buffer.
     fn write<T>(self, buf: T) -> Promise<(Self, T), Error<(Self, T)>> where T: Deref<Target=[u8]> {
         Promise::fulfilled(()).then(move |()| {
             write_internal(self, buf, 0)

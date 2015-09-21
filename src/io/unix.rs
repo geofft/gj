@@ -21,6 +21,7 @@
 
 use std::ops::{DerefMut, Deref};
 use std::result::Result;
+use std::os::unix::io::RawFd;
 use handle_table::{Handle};
 use ::io::{AsyncRead, AsyncWrite, try_read_internal, write_internal,
            FdObserver, HasHandle, register_new_handle,
@@ -148,10 +149,91 @@ impl Stream {
         Ok(Stream::new(stream, handle))
     }
 
-    pub unsafe fn from_raw_fd(fd: ::std::os::unix::io::RawFd) -> Result<Stream, ::std::io::Error> {
+    pub unsafe fn from_raw_fd(fd: RawFd) -> Result<Stream, ::std::io::Error> {
         let stream = ::std::os::unix::io::FromRawFd::from_raw_fd(fd);
         let handle = try!(register_new_handle(&stream));
         Ok(Stream::new(stream, handle))
+    }
+
+    pub fn try_read_recv_fd<T>(mut self, mut buf: T,
+                               min_bytes: usize) -> Promise<(Self, T, usize, Option<RawFd>), Error<(Self, T)>>
+        where T: DerefMut<Target=[u8]>
+    {
+        Promise::fulfilled(()).then(move |()| {
+            match self.stream.read_recv_fd(&mut buf[..]) {
+                Ok((n, fd)) => {
+                    if n >= min_bytes {
+                        Ok(Promise::fulfilled((self, buf, min_bytes, fd)))
+                    } else {
+                        // We've received the fd, but there's still more
+                        // data to fill out min_bytes. Chain to
+                        // try_read_internal, then stick the fd on when
+                        // it's done, or close it if it fails.
+                        match try_read_internal(self, buf, n, min_bytes) {
+                            Ok(p) => Ok(p.map_else(move |r| match r {
+                                Ok((s, buf, n)) => Ok((s, buf, n, fd)),
+                                Err(e) => {fd.map(::nix::unistd::close); Err(e)}
+                            })),
+                            Err(e) => {fd.map(::nix::unistd::close); Err(e)}
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == ::std::io::ErrorKind::WouldBlock {
+                        // Chain back to ourselves, to retry receiving
+                        // the fd.
+                        with_current_event_loop(move |event_loop| {
+                            let promise =
+                                event_loop.event_port.borrow_mut()
+                                .handler.observers[self.get_handle()].when_becomes_readable();
+                            Ok(promise.then_else(move |r| match r {
+                                Ok(()) => Ok(self.try_read_recv_fd(buf, min_bytes)),
+                                Err(e) => Err(Error::new((self, buf), e))
+                            }))
+                        })
+                    } else {
+                        Err(Error::new((self, buf), e))
+                    }
+                }
+            }
+        })
+    }
+
+    /// Like AsyncWrite::write, but sends a file descriptor across the socket using SCM_RIGHTS.
+    pub fn write_send_fd<T>(mut self, buf: T, fd: ::std::os::unix::io::RawFd) -> Promise<(Self, T), Error<(Self, T)>> where T: Deref<Target=[u8]> {
+        Promise::fulfilled(()).then(move |()| {
+            // The UNIX API is not super clear on partial delivery, but
+            // it seems that control data is sent all-or-nothing, but
+            // message data can be partially sent as with write. So we
+            // do one sendmsg, then hand off to write_internal.
+            match self.stream.write_send_fd(&buf[..], fd) {
+                Ok(n) => {
+                    if n == buf.len() {
+                        Ok(Promise::fulfilled((self, buf)))
+                    } else {
+                        // Control data was sent, but not all of the
+                        // message was written.
+                        write_internal(self, buf, n)
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == ::std::io::ErrorKind::WouldBlock {
+                        // Not even the control data got sent.
+                        with_current_event_loop(move |event_loop| {
+                            let promise =
+                                event_loop.event_port.borrow_mut()
+                                .handler.observers[self.get_handle()].when_becomes_writable();
+                            Ok(promise.then_else(move |r| match r {
+                                Ok(()) => Ok(self.write_send_fd(buf, fd)),
+                                Err(e) => Err(Error::new((self, buf), e))
+                            }))
+                        })
+                    } else {
+                        Err(Error::new((self, buf), e))
+                    }
+                }
+            }
+        })
     }
 }
 
